@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/logging"
 	"github.com/pion/randutil"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
@@ -20,6 +21,10 @@ import (
 
 type trackEncoding struct {
 	track TrackLocal
+
+	// rid remembers the RID of the track most recently bound to this encoding so
+	// that outbound stats can still report the RID after ReplaceTrack(nil).
+	rid string
 
 	srtpStream *srtpWriterFuture
 
@@ -54,6 +59,8 @@ type RTPSender struct {
 
 	mu                     sync.RWMutex
 	sendCalled, stopCalled chan struct{}
+
+	log logging.LeveledLogger
 }
 
 // NewRTPSender constructs a new RTPSender.
@@ -76,6 +83,7 @@ func (api *API) NewRTPSender(track TrackLocal, transport *DTLSTransport) (*RTPSe
 		stopCalled: make(chan struct{}),
 		id:         id,
 		kind:       track.Kind(),
+		log:        api.settingEngine.LoggerFactory.NewLogger("RTPSender"),
 	}
 
 	r.addEncoding(track)
@@ -200,6 +208,7 @@ func (r *RTPSender) AddEncoding(track TrackLocal) error { //nolint:cyclop
 func (r *RTPSender) addEncoding(track TrackLocal) {
 	trackEncoding := &trackEncoding{
 		track: track,
+		rid:   track.RID(),
 		ssrc:  SSRC(util.RandUint32()),
 	}
 
@@ -256,6 +265,9 @@ func (r *RTPSender) ReplaceTrack(track TrackLocal) error { //nolint:cyclop
 
 		if !r.hasSent() || track == nil {
 			e.track = track
+			if track != nil {
+				e.rid = track.RID()
+			}
 		}
 	}
 
@@ -293,6 +305,7 @@ func (r *RTPSender) ReplaceTrack(track TrackLocal) error { //nolint:cyclop
 	}
 
 	r.trackEncodings[0].track = track
+	r.trackEncodings[0].rid = track.RID()
 
 	return nil
 }
