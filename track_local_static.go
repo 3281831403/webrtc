@@ -239,6 +239,19 @@ type TrackLocalStaticSample struct {
 	rtpTrack   *TrackLocalStaticRTP
 	clockRate  float64
 	remainder  float64
+
+	// Position of the RTP stream as of the most recently packetized packets.
+	// RTPSender.ReplaceTrack reads this so a replacement track can continue
+	// the stream's sequence numbers and timestamps without a gap.
+	lastSeq     uint16
+	nextTS      uint32
+	hasPosition bool
+
+	// Stream position seeded via setRTPStreamPosition, applied when Bind
+	// creates the packetizer. Explicit WithRTPSequenceNumber/WithRTPTimestamp
+	// options take precedence over these values.
+	pendingSeq *uint16
+	pendingTS  *uint32
 }
 
 // NewTrackLocalStaticSample returns a TrackLocalStaticSample.
@@ -307,10 +320,14 @@ func (s *TrackLocalStaticSample) Bind(t TrackLocalContext) (RTPCodecParameters, 
 
 	if s.rtpTrack.initalTimestamp != nil {
 		options = append(options, rtp.WithTimestamp(*s.rtpTrack.initalTimestamp))
+	} else if s.pendingTS != nil {
+		options = append(options, rtp.WithTimestamp(*s.pendingTS))
 	}
 
 	if s.rtpTrack.initialSeqNumber != nil {
 		s.sequencer = rtp.NewFixedSequencer(*s.rtpTrack.initialSeqNumber)
+	} else if s.pendingSeq != nil {
+		s.sequencer = rtp.NewFixedSequencer(*s.pendingSeq)
 	}
 
 	if s.sequencer == nil {
@@ -373,6 +390,15 @@ func (s *TrackLocalStaticSample) WriteSample(sample media.Sample) error {
 
 	s.remainder = remainder
 	packets := packetizer.Packetize(sample.Data, curTicks)
+	if len(packets) > 0 {
+		s.lastSeq = packets[len(packets)-1].Header.SequenceNumber
+		s.nextTS = packets[len(packets)-1].Header.Timestamp + curTicks
+		s.hasPosition = true
+	} else if s.hasPosition {
+		// Empty payloads produce no packets but still advance the
+		// packetizer's timestamp.
+		s.nextTS += curTicks
+	}
 	s.mu.Unlock()
 
 	writeErrs := []error{}
@@ -400,6 +426,15 @@ func (s *TrackLocalStaticSample) GeneratePadding(samples uint32) error {
 
 	packets := p.GeneratePadding(samples)
 
+	if len(packets) > 0 {
+		// Padding consumes sequence numbers but doesn't advance the timestamp.
+		s.mu.Lock()
+		if s.hasPosition {
+			s.lastSeq = packets[len(packets)-1].Header.SequenceNumber
+		}
+		s.mu.Unlock()
+	}
+
 	writeErrs := []error{}
 	for _, p := range packets {
 		if err := s.rtpTrack.WriteRTP(p); err != nil {
@@ -408,4 +443,29 @@ func (s *TrackLocalStaticSample) GeneratePadding(samples uint32) error {
 	}
 
 	return util.FlattenErrs(writeErrs)
+}
+
+// rtpStreamPosition returns the sequence number and timestamp the track's next
+// packet would use, i.e. where a replacement track should continue the stream.
+// ok is false if nothing has been packetized yet.
+func (s *TrackLocalStaticSample) rtpStreamPosition() (nextSeq uint16, nextTS uint32, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.hasPosition {
+		return 0, 0, false
+	}
+
+	return s.lastSeq + 1, s.nextTS, true
+}
+
+// setRTPStreamPosition seeds the stream position used when Bind creates the
+// packetizer, so the track continues a previous track's RTP stream. It has no
+// effect once the packetizer exists.
+func (s *TrackLocalStaticSample) setRTPStreamPosition(nextSeq uint16, nextTS uint32) {
+	s.rtpTrack.mu.Lock()
+	defer s.rtpTrack.mu.Unlock()
+
+	s.pendingSeq = &nextSeq
+	s.pendingTS = &nextTS
 }

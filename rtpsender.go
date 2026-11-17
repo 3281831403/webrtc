@@ -29,6 +29,25 @@ type trackEncoding struct {
 	context *baseTrackLocalContext
 
 	ssrc, ssrcRTX, ssrcFEC SSRC
+
+	// Position of the RTP stream captured when the previous track was
+	// unbound. A replacement track that supports it continues the stream
+	// from here so the SSRC's sequence numbers and timestamps stay gapless.
+	nextSeq           uint16
+	nextTS            uint32
+	hasStreamPosition bool
+}
+
+// rtpStreamPositionTracker is implemented by TrackLocals that can report where
+// their RTP stream currently is (e.g. TrackLocalStaticSample).
+type rtpStreamPositionTracker interface {
+	rtpStreamPosition() (nextSeq uint16, nextTS uint32, ok bool)
+}
+
+// rtpStreamPositionSeeder is implemented by TrackLocals that can continue an
+// RTP stream from a given position (e.g. TrackLocalStaticSample).
+type rtpStreamPositionSeeder interface {
+	setRTPStreamPosition(nextSeq uint16, nextTS uint32)
 }
 
 // RTPSender allows an application to control how a given Track is encoded and transmitted to a remote peer.
@@ -249,6 +268,18 @@ func (r *RTPSender) ReplaceTrack(track TrackLocal) error { //nolint:cyclop
 		context = e.context
 
 		if r.hasSent() && replacedTrack != nil {
+			// Remember where the stream stopped so a track bound later
+			// (possibly after a ReplaceTrack(nil) pause) can continue it.
+			if tracker, ok := replacedTrack.(rtpStreamPositionTracker); ok {
+				if nextSeq, nextTS, ok := tracker.rtpStreamPosition(); ok {
+					e.nextSeq, e.nextTS, e.hasStreamPosition = nextSeq, nextTS, true
+				}
+			} else {
+				// The outgoing track can't report where the stream is,
+				// so any previously stored position is now stale.
+				e.hasStreamPosition = false
+			}
+
 			if err := replacedTrack.Unbind(context); err != nil {
 				return err
 			}
@@ -267,6 +298,16 @@ func (r *RTPSender) ReplaceTrack(track TrackLocal) error { //nolint:cyclop
 		track.Kind(),
 		[]RTPTransceiverDirection{RTPTransceiverDirectionSendonly},
 	)
+
+	// Let the new track continue the previous track's RTP stream (sequence
+	// numbers and timestamps) when it supports doing so. Tracks where the
+	// application fills RTP headers itself (TrackLocalStaticRTP) are left
+	// untouched.
+	if enc := r.trackEncodings[0]; enc.hasStreamPosition {
+		if seeder, ok := track.(rtpStreamPositionSeeder); ok {
+			seeder.setRTPStreamPosition(enc.nextSeq, enc.nextTS)
+		}
+	}
 
 	// If we reach this point in the routine, there is only 1 track encoding
 	codec, err := track.Bind(&baseTrackLocalContext{

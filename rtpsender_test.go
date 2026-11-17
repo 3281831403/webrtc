@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
 	"github.com/pion/transport/v5/test"
 	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/stretchr/testify/assert"
@@ -281,6 +282,157 @@ func Test_RTPSender_GetParameters_NilTrack(t *testing.T) {
 	rtpSender.GetParameters()
 
 	assert.NoError(t, peerConnection.Close())
+}
+
+// errBindTrack is a TrackLocal whose Bind always fails, used to verify that a
+// failed ReplaceTrack rolls back and leaves the original stream untouched.
+type errBindTrack struct{}
+
+var errBindTrackBind = errors.New("errBindTrack: bind failed")
+
+func (e *errBindTrack) Bind(TrackLocalContext) (RTPCodecParameters, error) {
+	return RTPCodecParameters{}, errBindTrackBind
+}
+
+func (e *errBindTrack) Unbind(TrackLocalContext) error { return nil }
+func (e *errBindTrack) ID() string                     { return "errBindTrack" }
+func (e *errBindTrack) RID() string                    { return "" }
+func (e *errBindTrack) StreamID() string               { return "pion" }
+func (e *errBindTrack) Kind() RTPCodecType             { return RTPCodecTypeVideo }
+
+// Test_RTPSender_ReplaceTrack_StreamContinuity verifies that ReplaceTrack
+// keeps the RTP stream of the sender's SSRC continuous: sequence numbers
+// increment by one and timestamps advance by the sample duration across
+// source switches (including codec changes and ReplaceTrack(nil) pauses),
+// and that a failed replace rolls back without disturbing the original stream.
+func Test_RTPSender_ReplaceTrack_StreamContinuity(t *testing.T) { //nolint:cyclop
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	s := SettingEngine{}
+	s.DisableSRTPReplayProtection(true)
+
+	sender, receiver, err := NewAPI(WithSettingEngine(s)).newPair(Configuration{})
+	assert.NoError(t, err)
+
+	trackA, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: MimeTypeVP8}, "video", "pion")
+	assert.NoError(t, err)
+
+	rtpSender, err := sender.AddTrack(trackA)
+	assert.NoError(t, err)
+
+	packetCh := make(chan *rtp.Packet, 100)
+	receiver.OnTrack(func(track *TrackRemote, _ *RTPReceiver) {
+		for {
+			pkt, _, readErr := track.ReadRTP()
+			if readErr != nil {
+				return
+			}
+			packetCh <- pkt
+		}
+	})
+
+	peerConnectionsConnected := untilConnectionState(PeerConnectionStateConnected, sender, receiver)
+	assert.NoError(t, signalPair(sender, receiver))
+	<-peerConnectionsConnected
+
+	readPacket := func() *rtp.Packet {
+		t.Helper()
+		select {
+		case pkt := <-packetCh:
+			return pkt
+		case <-time.After(10 * time.Second):
+			t.Fatal("timed out waiting for RTP packet")
+
+			return nil
+		}
+	}
+
+	const sampleDuration = 20 * time.Millisecond
+	const sampleTicks = 1800 // 20ms at 90kHz
+
+	writeSample := func(track *TrackLocalStaticSample) {
+		t.Helper()
+		assert.NoError(t, track.WriteSample(media.Sample{Data: []byte{0x00, 0x01}, Duration: sampleDuration}))
+	}
+
+	newVideoTrack := func(mimeType string) *TrackLocalStaticSample {
+		t.Helper()
+		track, trackErr := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: mimeType}, "video", "pion")
+		assert.NoError(t, trackErr)
+
+		return track
+	}
+
+	// Baseline: two packets from the original VP8 source.
+	writeSample(trackA)
+	pktA1 := readPacket()
+	writeSample(trackA)
+	pktA2 := readPacket()
+	assert.Equal(t, pktA1.SequenceNumber+1, pktA2.SequenceNumber)
+	assert.Equal(t, pktA1.Timestamp+sampleTicks, pktA2.Timestamp)
+
+	ssrc := pktA1.SSRC
+	vp8PT := pktA1.PayloadType
+
+	// VP8 -> VP8: the new source continues the stream.
+	trackB := newVideoTrack(MimeTypeVP8)
+	assert.NoError(t, rtpSender.ReplaceTrack(trackB))
+	writeSample(trackB)
+	pktB := readPacket()
+	assert.Equal(t, pktA2.SequenceNumber+1, pktB.SequenceNumber)
+	assert.Equal(t, pktA2.Timestamp+sampleTicks, pktB.Timestamp)
+	assert.Equal(t, ssrc, pktB.SSRC)
+	assert.Equal(t, vp8PT, pktB.PayloadType)
+
+	// VP8 -> H264: still continuous, and the receiver can tell the new codec
+	// apart by the negotiated payload type.
+	trackC := newVideoTrack(MimeTypeH264)
+	assert.NoError(t, rtpSender.ReplaceTrack(trackC))
+	writeSample(trackC)
+	pktC := readPacket()
+	assert.Equal(t, pktB.SequenceNumber+1, pktC.SequenceNumber)
+	assert.Equal(t, pktB.Timestamp+sampleTicks, pktC.Timestamp)
+	assert.Equal(t, ssrc, pktC.SSRC)
+	assert.NotEqual(t, vp8PT, pktC.PayloadType)
+
+	var h264PT uint8
+	for _, codec := range sender.api.mediaEngine.getCodecsByKind(RTPCodecTypeVideo) {
+		if codec.MimeType == MimeTypeH264 {
+			h264PT = uint8(codec.PayloadType)
+
+			break
+		}
+	}
+	assert.Equal(t, h264PT, pktC.PayloadType)
+
+	// ReplaceTrack(nil) pauses the stream; samples written to the unbound
+	// track never reach the network and must not move the resume position.
+	assert.NoError(t, rtpSender.ReplaceTrack(nil))
+	assert.NoError(t, trackC.WriteSample(media.Sample{Data: []byte{0x00, 0x01}, Duration: sampleDuration}))
+
+	trackD := newVideoTrack(MimeTypeVP8)
+	assert.NoError(t, rtpSender.ReplaceTrack(trackD))
+	writeSample(trackD)
+	pktD := readPacket()
+	assert.Equal(t, pktC.SequenceNumber+1, pktD.SequenceNumber)
+	assert.Equal(t, pktC.Timestamp+sampleTicks, pktD.Timestamp)
+	assert.Equal(t, ssrc, pktD.SSRC)
+	assert.Equal(t, vp8PT, pktD.PayloadType)
+
+	// A failed replace rolls back: the original track keeps streaming and its
+	// sequence numbers and timestamps are unaffected.
+	assert.True(t, errors.Is(rtpSender.ReplaceTrack(&errBindTrack{}), errBindTrackBind))
+	writeSample(trackD)
+	pktD2 := readPacket()
+	assert.Equal(t, pktD.SequenceNumber+1, pktD2.SequenceNumber)
+	assert.Equal(t, pktD.Timestamp+sampleTicks, pktD2.Timestamp)
+	assert.Equal(t, ssrc, pktD2.SSRC)
+
+	closePairNow(t, sender, receiver)
 }
 
 func Test_RTPSender_Send(t *testing.T) {
